@@ -1,26 +1,22 @@
 import os
 import json
-import time
-from datetime import datetime
-
-import requests
-import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 
-URL = "https://cosmetica.fda.moph.go.th/CMT_SEARCH_BACK_NEW/Home/FUNCTION_CENTER"
-
-# ---- 1) connect Google Sheets ----
-SCOPES = [
+# 1) โหลด service account จาก secret
+creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+scopes = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-
-sa_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
 gc = gspread.authorize(creds)
 
-SPREADSHEET_ID = "19ciuRoIOKVe3Rdrzi7HBAw_Sq_bEebwu"
+# 2) ใช้ spreadsheet ID ที่ถูกต้อง
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "19ciuRoIOKVe3Rdrzi7HBAw_Sq_bEebwu")
+
+sh = gc.open_by_key(SPREADSHEET_ID)
+ws_result = sh.worksheet("RESULT")   # ต้องมีแท็บชื่อ RESULT
 
 # แท็บผลลัพธ์ (สร้างชื่อแท็บนี้ไว้ก่อนใน Google Sheets เช่น 'RESULT')
 ws_result = gc.open_by_key(SPREADSHEET_ID).worksheet("RESULT")
