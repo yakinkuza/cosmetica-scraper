@@ -17,7 +17,7 @@ URL = "https://cosmetica.fda.moph.go.th/CMT_SEARCH_BACK_NEW/Home/FUNCTION_CENTER
 # เอา spreadsheet id จาก Secrets ถ้าไม่ได้ตั้งก็ fallback เป็น id ของไฟล์ที่ส่งมา
 SPREADSHEET_ID = os.environ.get(
     "SPREADSHEET_ID",
-    "19ciuRoIOKVe3Rdrzi7HBAw_Sq_bEebwu",
+    "1sEwh39a_C_jcYXBPbkU6tN_nWUmp7_juEQkBy7gcoxM",
 )
 
 INPUT_SHEET_NAME = "INPUT"   # ลิสต์เลขจดแจ้ง (มี header แถว 1)
