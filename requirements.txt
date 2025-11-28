@@ -1,6 +1,5 @@
 requests
 pandas
 tqdm
-openpyxl
 gspread
-google-auth
+oauth2client
