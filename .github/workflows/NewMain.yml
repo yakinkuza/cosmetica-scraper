@@ -1,49 +1,32 @@
-name: FDA Scraper
+name: Run FDA scraper
 
 on:
-  # ให้รันทุกวันเวลา 01:00 น. (เวลาไทย = UTC+7)
+  workflow_dispatch:      # กด Run เองได้
   schedule:
-    - cron: "0 18 * * *"   # 18:00 UTC = 01:00 ICT
-  # ให้เรากดรันเองได้
-  workflow_dispatch:
+    - cron: "*/10 * * * *"   # รันทุก 10 นาที
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 360    # จำกัดเวลางานนี้ 6 ชั่วโมง
 
     steps:
-      # 1) ดึงโค้ดจาก repo
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 2) ติดตั้ง Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3) ติดตั้ง dependencies ที่ต้องใช้
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests tqdm gspread google-auth openpyxl
+          pip install -r requirements.txt
 
-      # 4) รันสคริปต์หลัก
       - name: Run scraper
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: |
           python scrape_fda.py
-
-      # 5) (ถ้าอยากเก็บ output ของรอบล่าสุดเป็น artifact ด้วย)
-      - name: Upload output artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fda-output
-          path: |
-            output/*.csv
-            output/*.xlsx
-            *.csv
-            *.xlsx
-          if-no-files-found: ignore
