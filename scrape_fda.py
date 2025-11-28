@@ -1,35 +1,110 @@
-#!/usr/bin/env python
 import os
 import json
 import time
-from typing import Dict, Any, List
-
 import requests
-import gspread
-from google.oauth2.service_account import Credentials
-from tqdm import tqdm
 
-# ===============================
-# CONFIG
-# ===============================
+import gspread
+from gspread.exceptions import WorksheetNotFound
+
+# -----------------------------
+# Config
+# -----------------------------
 URL = "https://cosmetica.fda.moph.go.th/CMT_SEARCH_BACK_NEW/Home/FUNCTION_CENTER"
 
-# เอา spreadsheet id จาก Secrets ถ้าไม่ได้ตั้งก็ fallback เป็น id ของไฟล์ที่ส่งมา
-SPREADSHEET_ID = os.environ.get(
-    "SPREADSHEET_ID",
+# ID ของ Google Sheet (ตัวใหม่ที่คุณบีมให้มา)
+SHEET_ID = os.getenv(
+    "SHEET_ID",
     "1sEwh39a_C_jcYXBPbkU6tN_nWUmp7_juEQkBy7gcoxM",
 )
 
-INPUT_SHEET_NAME = "INPUT"   # ลิสต์เลขจดแจ้ง (มี header แถว 1)
-RESULT_SHEET_NAME = "RESULT" # เก็บผลลัพธ์
-ERROR_SHEET_NAME = "ERROR"   # เก็บ error
+# ชื่อแท็บใน Google Sheet
+LIST_SHEET_NAME = os.getenv("LIST_SHEET_NAME", "LIST")
+RESULT_SHEET_NAME = os.getenv("RESULT_SHEET_NAME", "RESULT")
+ERROR_SHEET_NAME = os.getenv("ERROR_SHEET_NAME", "ERROR")
 
-BATCH_SIZE = 100             # เซฟลง RESULT ทีละกี่รายการ
-MAX_RETRIES = 3              # retry request ต่อเลขจดแจ้ง
-TIMEOUT = 30                 # timeout ของ request (วินาที)
+# จำนวน record สูงสุดต่อการรัน 1 ครั้ง (กันไม่ให้ run นานเกินไป)
+MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "500"))
 
-# list คอลัมน์ที่ต้องการจาก datail_string
-DETAIL_COLUMNS = [
+# batch ที่จะเขียนกลับเข้า Google Sheet ทีละกี่แถว
+BATCH_WRITE_SIZE = int(os.getenv("BATCH_WRITE_SIZE", "50"))
+
+# -----------------------------
+# Helper: connect gspread
+# -----------------------------
+def get_gspread_client():
+    """
+    ใช้ GOOGLE_SERVICE_ACCOUNT_JSON จาก GitHub Secret
+    เพื่อสร้าง gspread client
+    """
+    creds_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    creds_dict = json.loads(creds_json)
+    return gspread.service_account_from_dict(creds_dict)
+
+
+# -----------------------------
+# FDA API
+# -----------------------------
+def build_payload(regnos: str) -> dict:
+    """
+    สร้าง payload สำหรับเรียก get_detail_regnos
+    regnos ต้องเป็นเลขแบบไม่มีขีด เช่น "1026700038284"
+    """
+    return {
+        "MODEL": {
+            "M_SYSTEM_SETTING": {"FUNCTION_NAME": "get_detail_regnos"},
+            "M_AUTHENTICATION": {},
+            "DATA_SET": {},
+            "DATA_TRANSLATION_OB": None,
+            "Search": {},
+            "datail_string": {
+                "regnos": regnos,  # สำคัญสุด
+                # field อื่นปล่อยว่าง ระบบจะเติมให้เอง
+            },
+            "M_tran": {},
+        }
+    }
+
+
+def call_fda(regnos: str, retry: int = 3, sleep_sec: float = 1.0) -> dict | None:
+    """
+    เรียก API FDA ด้วย regnos (ไม่มีขีด) แล้วคืนค่า datail_string (dict)
+    ถ้า error หลายครั้ง คืน None
+    """
+    payload = build_payload(regnos)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+    }
+
+    for attempt in range(1, retry + 1):
+        try:
+            r = requests.post(URL, headers=headers, data=json.dumps(payload), timeout=30)
+            r.raise_for_status()
+            data = r.json()
+
+            model = data.get("MODEL", data)
+            detail = model.get("datail_string", None)
+
+            # ถ้าได้ detail กลับมา ก็จบ
+            if detail:
+                return detail
+
+            # ถ้า detail ว่าง ลอง print ดูเพื่อ debug
+            print(f"  ⚠ regnos {regnos}: datail_string is empty")
+            return None
+
+        except Exception as e:
+            print(f"  ❌ regnos {regnos}: attempt {attempt} failed -> {e}")
+            if attempt < retry:
+                time.sleep(sleep_sec * attempt)
+            else:
+                return None
+
+
+# -----------------------------
+# Helper: flatten detail → row
+# -----------------------------
+DETAIL_KEYS = [
     "regnos",
     "type",
     "lb_lct_type",
@@ -64,178 +139,133 @@ DETAIL_COLUMNS = [
     "physical_detail",
 ]
 
-# ===============================
-# GSPREAD HELPER
-# ===============================
 
-def get_gspread_client() -> gspread.Client:
-    """สร้าง gspread client จาก GOOGLE_SERVICE_ACCOUNT_JSON (เก็บใน GitHub Secrets)"""
-    creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-    gc = gspread.authorize(creds)
-    return gc
+def normalize_value(v):
+    if v is None:
+        return ""
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return str(v)
 
 
-def open_sheets(gc: gspread.Client):
-    sh = gc.open_by_key(SPREADSHEET_ID)
-    ws_input = sh.worksheet(INPUT_SHEET_NAME)
-    ws_result = sh.worksheet(RESULT_SHEET_NAME)
-    ws_error = sh.worksheet(ERROR_SHEET_NAME)
-    return ws_input, ws_result, ws_error
-
-
-def init_result_header(ws_result: gspread.Worksheet) -> None:
-    """ถ้า RESULT ยังไม่มี header ให้สร้าง"""
-    values = ws_result.get_all_values()
-    if not values:
-        header = ["notify_number"] + DETAIL_COLUMNS
-        ws_result.append_row(header, value_input_option="RAW")
-
-
-def init_error_header(ws_error: gspread.Worksheet) -> None:
-    values = ws_error.get_all_values()
-    if not values:
-        ws_error.append_row(
-            ["notify_number", "regnos", "error_message"],
-            value_input_option="RAW",
-        )
-
-
-def read_notify_numbers(ws_input: gspread.Worksheet) -> List[str]:
-    """อ่านเลขจดแจ้งจากชีต INPUT คอลัมน์ A (ข้าม header)"""
-    col = ws_input.col_values(1)
-    # แถวแรก header
-    return [v.strip() for v in col[1:] if v.strip()]
-
-
-def read_done_notify_numbers(ws_result: gspread.Worksheet) -> set:
-    """อ่านเลขจดแจ้งที่ทำเสร็จแล้วจาก RESULT (คอลัมน์ notify_number)"""
-    values = ws_result.col_values(1)
-    return set(v.strip() for v in values[1:] if v.strip())
-
-
-# ===============================
-# FDA API
-# ===============================
-
-def build_payload(regnos: str) -> Dict[str, Any]:
-    return {
-        "MODEL": {
-            "M_SYSTEM_SETTING": {"FUNCTION_NAME": "get_detail_regnos"},
-            "M_AUTHENTICATION": {},
-            "DATA_SET": {},
-            "DATA_TRANSLATION_OB": None,
-            "Search": {},
-            "datail_string": {
-                "regnos": regnos,
-            },
-            "M_tran": {},
-        }
-    }
-
-
-def fetch_detail(regnos: str) -> Dict[str, Any]:
-    """เรียก API พร้อม retry"""
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/plain, */*",
-    }
-
-    payload = build_payload(regnos)
-
-    last_exc = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = requests.post(
-                URL,
-                headers=headers,
-                json=payload,
-                timeout=TIMEOUT,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            model = data.get("MODEL", data)
-            detail = model.get("datail_string", {}) or {}
-            return detail
-        except Exception as exc:
-            last_exc = exc
-            # backoff นิดหน่อย
-            time.sleep(3 * attempt)
-
-    # ถ้าไม่สำเร็จซักรอบให้โยน exception กลับไป
-    raise last_exc
-
-
-def detail_to_row(notify_number: str, detail: Dict[str, Any]) -> List[Any]:
-    """แปลง detail_string ให้เป็น list ตามคอลัมน์ที่กำหนด"""
+def detail_to_row(notify_number: str, detail: dict) -> list:
+    """
+    แปลง dict datail_string → list สำหรับเขียนลง Google Sheet
+    column แรกคือ notify_number แบบมีขีด
+    """
     row = [notify_number]
-    for col in DETAIL_COLUMNS:
-        val = detail.get(col, "")
-        # แปลง dict / list เป็น JSON string ถ้ามี
-        if isinstance(val, (dict, list)):
-            val = json.dumps(val, ensure_ascii=False)
-        row.append(val)
+    for key in DETAIL_KEYS:
+        row.append(normalize_value(detail.get(key)))
     return row
 
 
-# ===============================
-# MAIN LOGIC
-# ===============================
+def get_result_header() -> list:
+    return ["notify_number"] + DETAIL_KEYS
 
+
+# -----------------------------
+# Main
+# -----------------------------
 def main():
+    print("🚀 Start scraping")
+
     gc = get_gspread_client()
-    ws_input, ws_result, ws_error = open_sheets(gc)
+    sh = gc.open_by_key(SHEET_ID)
 
-    init_result_header(ws_result)
-    init_error_header(ws_error)
+    # --- เตรียม worksheet ต่าง ๆ ---
+    ws_list = sh.worksheet(LIST_SHEET_NAME)
 
-    notify_numbers = read_notify_numbers(ws_input)
-    done_numbers = read_done_notify_numbers(ws_result)
+    try:
+        ws_result = sh.worksheet(RESULT_SHEET_NAME)
+    except WorksheetNotFound:
+        ws_result = sh.add_worksheet(RESULT_SHEET_NAME, rows=1000, cols=50)
+        ws_result.append_row(get_result_header())
+        print(f"✅ Created sheet '{RESULT_SHEET_NAME}' with header")
 
-    # เลขที่ยังไม่ได้ทำ
-    todo = [n for n in notify_numbers if n not in done_numbers]
+    try:
+        ws_error = sh.worksheet(ERROR_SHEET_NAME)
+    except WorksheetNotFound:
+        ws_error = sh.add_worksheet(ERROR_SHEET_NAME, rows=1000, cols=10)
+        ws_error.append_row(["notify_number", "regnos_no_dash", "error_message"])
+        print(f"✅ Created sheet '{ERROR_SHEET_NAME}' with header")
 
-    if not todo:
-        print("All notify numbers are already processed.")
+    # --- โหลดเลขทั้งหมดจาก LIST ---
+    all_vals = ws_list.col_values(1)  # คอลัมน์ A ทั้งหมด
+    if not all_vals:
+        print("❌ LIST sheet col A ว่างเปล่า")
         return
 
-    print(f"Total notify numbers: {len(notify_numbers)}")
-    print(f"Already done       : {len(done_numbers)}")
-    print(f"To do              : {len(todo)}")
+    # แยก header + list จริง
+    if all_vals[0].strip().lower().startswith("notify"):
+        notify_all = [v.strip() for v in all_vals[1:] if v.strip()]
+    else:
+        notify_all = [v.strip() for v in all_vals if v.strip()]
 
-    batch_rows: List[List[Any]] = []
+    print(f"🔢 Total notify numbers in LIST: {len(notify_all)}")
 
-    with tqdm(total=len(todo), desc="Scraping", unit="item") as pbar:
-        for notify_number in todo:
-            regnos = notify_number.replace("-", "")
-            try:
-                detail = fetch_detail(regnos)
-                row = detail_to_row(notify_number, detail)
-                batch_rows.append(row)
-            except Exception as exc:
-                # บันทึก error แยกต่างหาก
-                ws_error.append_row(
-                    [notify_number, regnos, str(exc)],
-                    value_input_option="RAW",
-                )
+    # --- โหลด notify ที่เคยดึงไปแล้วจาก RESULT (เลี่ยงซ้ำ) ---
+    result_vals = ws_result.col_values(1)  # notify_number อยู่คอลัมน์แรก
+    if result_vals and result_vals[0] == "notify_number":
+        done_set = set(v.strip() for v in result_vals[1:] if v.strip())
+    else:
+        done_set = set(v.strip() for v in result_vals if v.strip())
 
-            # flush ทีละชุด
-            if len(batch_rows) >= BATCH_SIZE:
-                ws_result.append_rows(batch_rows, value_input_option="RAW")
-                batch_rows = []
+    print(f"✅ Already scraped: {len(done_set)}")
 
-            pbar.update(1)
+    # เลือกเฉพาะที่ยังไม่เคยดึง
+    to_scrape_all = [n for n in notify_all if n not in done_set]
 
-        # เหลือชุดสุดท้าย
-        if batch_rows:
+    if not to_scrape_all:
+        print("🎉 All records already scraped. Nothing to do.")
+        return
+
+    # จำกัดจำนวนต่อการรัน
+    to_scrape = to_scrape_all[:MAX_PER_RUN]
+    print(f"🧮 This run will scrape: {len(to_scrape)} records")
+
+    # --- Loop ดึงข้อมูล ---
+    batch_rows = []
+    error_rows = []
+
+    for idx, notify in enumerate(to_scrape, start=1):
+        regnos = notify.replace("-", "")
+        print(f"[{idx}/{len(to_scrape)}] {notify} -> {regnos}")
+
+        detail = call_fda(regnos)
+
+        if detail:
+            row = detail_to_row(notify, detail)
+            batch_rows.append(row)
+        else:
+            error_rows.append(
+                [notify, regnos, "No data or API error (see logs)"]
+            )
+
+        # เขียนเป็น batch ลง RESULT ทุก ๆ BATCH_WRITE_SIZE แถว
+        if len(batch_rows) >= BATCH_WRITE_SIZE:
             ws_result.append_rows(batch_rows, value_input_option="RAW")
+            print(f"  💾 Wrote {len(batch_rows)} rows to RESULT")
+            batch_rows = []
 
-    print("Done scraping.")
+        # เขียน error เป็น batch
+        if len(error_rows) >= BATCH_WRITE_SIZE:
+            ws_error.append_rows(error_rows, value_input_option="RAW")
+            print(f"  💾 Wrote {len(error_rows)} rows to ERROR")
+            error_rows = []
+
+        # กัน API โดน spam จน block (ปรับได้ตามจริง)
+        time.sleep(0.2)
+
+    # เขียนเศษ batch ที่เหลือ
+    if batch_rows:
+        ws_result.append_rows(batch_rows, value_input_option="RAW")
+        print(f"💾 Wrote final {len(batch_rows)} rows to RESULT")
+
+    if error_rows:
+        ws_error.append_rows(error_rows, value_input_option="RAW")
+        print(f"💾 Wrote final {len(error_rows)} rows to ERROR")
+
+    print("✅ Done this run")
 
 
 if __name__ == "__main__":
