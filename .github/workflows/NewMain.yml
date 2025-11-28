@@ -1,32 +1,35 @@
-name: Run FDA scraper
+name: Run scraper
 
 on:
-  workflow_dispatch:      # กด Run เองได้
+  # กดรันมือ
+  workflow_dispatch:
+  # รันทุก 10 นาที
   schedule:
-    - cron: "*/10 * * * *"   # รันทุก 10 นาที
+    - cron: "*/10 * * * *"
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 360    # จำกัดเวลางานนี้ 6 ชั่วโมง
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run scraper
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SHEET_ID: "1sEwh39a_C_jcYXBPbkU6tN_nWUmp7_juEQkBy7gcoxM"
+          # ปรับได้ถ้าอยากให้ดึงมากหรือน้อยต่อรัน
+          MAX_PER_RUN: "500"
         run: |
           python scrape_fda.py
